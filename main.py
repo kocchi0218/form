@@ -1,18 +1,16 @@
-# app.py
 """
-Streamlit版 3-2-1投票アプリ（ID方式・翻訳抑止・候補編集/同義統合・氏名/社員番号・サンクス・投票一覧・順位/グラフ）
+Streamlit版 3-2-1投票アプリ（ID方式・翻訳抑止・候補編集/同義統合・氏名/社員番号・サンクス・投票一覧）
 --------------------------------------------------------------------------------
 ■ 機能
 - 投票：1位=3点 / 2位=2点 / 3位=1点（重複不可）、氏名・社員番号の入力付き
 - サンクス画面：送信後に「送信しました」に自動遷移
-- 集計：総得点・1/2/3位回数・順位（1始まり）を表示、CSVダウンロード
-- グラフ：合計ポイントの棒グラフ、1/2/3位回数の積み上げ棒グラフ
+- 集計：総得点・1/2/3位回数・順位表の表示とCSVダウンロード
 - 投票一覧：氏名・社員番号つきの生票一覧表示とCSVダウンロード
 - 管理：候補の追加／名称変更／有効/無効切替、同義統合（重複候補の票も安全に付替え）
 - 翻訳抑止：Google翻訳の自動提案を抑止（完全ではないが軽減）
 
 ■ 起動
-  pip install streamlit pandas altair
+  pip install streamlit pandas
   streamlit run app.py
   → 投票:  http://localhost:8501/?page=vote
   → 集計:  http://localhost:8501/?page=admin
@@ -25,7 +23,6 @@ from datetime import datetime
 from typing import Dict
 import pandas as pd
 import streamlit as st
-import altair as alt
 
 st.set_page_config(page_title="3-2-1 投票アプリ", layout="centered")
 
@@ -172,7 +169,7 @@ def append_vote(voter_name: str, employee_id: str, first_id: str, second_id: str
         "first_id": first_id,
         "second_id": second_id,
         "third_id": third_id,
-        "time": datetime.now().isoformat(timespec="seconds"),
+        "time": datetime.now().isoformat(),
     }
     votes = pd.concat([votes, pd.DataFrame([new_row])], ignore_index=True)
     votes.to_csv(VOTES_FILE, index=False)
@@ -195,7 +192,7 @@ def aggregate(cands: pd.DataFrame, votes: pd.DataFrame, include_inactive: bool =
         return pd.DataFrame(columns=["候補", "points", "first", "second", "third"])
     df = df.sort_values(["points", "first", "second", "third", "候補"],
                         ascending=[False, False, False, False, True]).reset_index(drop=True)
-    df.index = range(1, len(df) + 1)  # 1始まり → これを順位として使う
+    df.index = range(1, len(df) + 1)
     return df
 
 # ============================
@@ -256,80 +253,15 @@ elif page == "admin":
     include_inactive = st.checkbox("非表示候補も集計表に含める", value=True)
     res_df = aggregate(cands, votes, include_inactive=include_inactive)
 
-    # ── 順位表（順位=1始まりのindexを列に）+ CSV
+    # 順位表
     st.subheader("順位表")
-    if votes.empty or res_df.empty:
+    if votes.empty:
         st.info("まだ投票はありません")
-        res_df_disp = pd.DataFrame(columns=["順位","候補","合計ポイント","1位回数","2位回数","3位回数"])
-    else:
-        res_df_disp = (
-            res_df.reset_index()
-                  .rename(columns={
-                      "index": "順位",
-                      "points": "合計ポイント",
-                      "first": "1位回数",
-                      "second": "2位回数",
-                      "third": "3位回数",
-                  })
-        )
-        st.dataframe(res_df_disp, use_container_width=True)
-    csv = res_df_disp.to_csv(index=False)
-    st.download_button("順位表CSVダウンロード", data=csv, file_name="result.csv", mime="text/csv")
+    st.dataframe(res_df, use_container_width=True)
+    csv = res_df.to_csv(index=True)
+    st.download_button("CSVダウンロード", data=csv, file_name="result.csv", mime="text/csv")
 
-    # ── グラフ：合計ポイント（棒）
-    st.subheader("合計ポイント（棒グラフ）")
-    if not res_df.empty:
-        chart_df = (
-            res_df.reset_index()
-                  .rename(columns={"index": "順位", "points": "合計ポイント"})
-        )
-        chart = (
-            alt.Chart(chart_df)
-               .mark_bar()
-               .encode(
-                   x=alt.X("候補:N", sort='-y', title="候補"),
-                   y=alt.Y("合計ポイント:Q", title="合計ポイント"),
-                   tooltip=["順位","候補","合計ポイント","first","second","third"]
-               )
-               .properties(height=320)
-        )
-        st.altair_chart(chart, use_container_width=True)
-    else:
-        st.caption("投票が入るとここに合計ポイントのグラフが表示されます。")
-
-    # ── グラフ：1/2/3位回数（積み上げ棒）
-    st.subheader("1位・2位・3位 回数（積み上げ棒グラフ）")
-    if not res_df.empty:
-        counts_df = (
-            res_df.reset_index()
-                  .rename(columns={
-                      "index": "順位",
-                      "first": "1位回数",
-                      "second": "2位回数",
-                      "third": "3位回数",
-                  })
-        )
-        counts_melt = counts_df.melt(
-            id_vars=["順位","候補"],
-            value_vars=["1位回数","2位回数","3位回数"],
-            var_name="区分", value_name="回数"
-        )
-        chart2 = (
-            alt.Chart(counts_melt)
-               .mark_bar()
-               .encode(
-                   x=alt.X("候補:N", sort='-y', title="候補"),
-                   y=alt.Y("回数:Q", title="回数"),
-                   color=alt.Color("区分:N", title="順位区分"),
-                   tooltip=["順位","候補","区分","回数"]
-               )
-               .properties(height=320)
-        )
-        st.altair_chart(chart2, use_container_width=True)
-
-    st.divider()
-
-    # ── 投票一覧（氏名・社員番号つき）
+    # 投票一覧（氏名・社員番号つき）
     st.subheader("投票一覧（氏名・社員番号つき）")
     if votes.empty:
         st.info("まだ投票はありません")
@@ -348,7 +280,7 @@ elif page == "admin":
 
     st.divider()
 
-    # ── 候補の編集（追加 / 名称変更 / 有効・無効切替 / 同義統合）
+    # 候補の編集（追加 / 名称変更 / 有効・無効切替 / 同義統合）
     st.subheader("候補の編集")
 
     col_add1, col_add2 = st.columns([3, 1])
@@ -445,10 +377,12 @@ elif page == "admin":
 elif page == "thanks":
     st.header("送信しました")
     st.success("ご投票ありがとうございました！")
-    st.markdown("[🗳️ もう一度投票する](?page=vote)")
+    st.markdown("[🗳️ もう一度投票する](?page=vote) | [📊 集計を見る](?page=admin)")
 
 # ---------------- フォールバック ----------------
 else:
     st.info("""以下のURLを利用してください:
 - 投票: ?page=vote
 - 集計: ?page=admin""")
+
+
