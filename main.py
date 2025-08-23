@@ -1,16 +1,20 @@
+# app.py
 """
-Streamlit版 3-2-1投票アプリ（ID方式・翻訳抑止・候補編集/同義統合・氏名/社員番号・サンクス・投票一覧）
+Streamlit版 3-2-1投票アプリ（ID方式・翻訳抑止・候補編集/同義統合・氏名/社員番号・サンクス・投票一覧・順位/グラフ・自動更新）
 --------------------------------------------------------------------------------
 ■ 機能
 - 投票：1位=3点 / 2位=2点 / 3位=1点（重複不可）、氏名・社員番号の入力付き
 - サンクス画面：送信後に「送信しました」に自動遷移
-- 集計：総得点・1/2/3位回数・順位表の表示とCSVダウンロード
-- 投票一覧：氏名・社員番号つきの生票一覧表示とCSVダウンロード
+- 集計：総得点・1/2/3位回数・順位（1始まり）を表示、CSVダウンロード
+- グラフ：合計ポイントの棒グラフ、1/2/3位回数の積み上げ棒グラフ
+- 投票一覧：氏名・社員番号つきの生票一覧（ラベル表示）CSV/Excelダウンロード
 - 管理：候補の追加／名称変更／有効/無効切替、同義統合（重複候補の票も安全に付替え）
 - 翻訳抑止：Google翻訳の自動提案を抑止（完全ではないが軽減）
+- 先頭ゼロ保持：社員番号は常に文字列扱い。画面表示で任意桁のゼロ埋め可。Excelは文字列書式で出力。
+- 自動更新：管理（集計）ページのみ、一定間隔で自動再読み込み
 
 ■ 起動
-  pip install streamlit pandas
+  pip install streamlit pandas altair xlsxwriter streamlit-autorefresh
   streamlit run app.py
   → 投票:  http://localhost:8501/?page=vote
   → 集計:  http://localhost:8501/?page=admin
@@ -18,11 +22,20 @@ Streamlit版 3-2-1投票アプリ（ID方式・翻訳抑止・候補編集/同�
 """
 
 from __future__ import annotations
-import os, re, unicodedata, uuid
+import os, re, unicodedata, uuid, csv
+from io import BytesIO
 from datetime import datetime
 from typing import Dict
 import pandas as pd
 import streamlit as st
+import altair as alt
+
+# （あれば使う）自動更新ライブラリ
+try:
+    from streamlit_autorefresh import st_autorefresh
+    _HAS_AUTOREFRESH = True
+except Exception:
+    _HAS_AUTOREFRESH = False
 
 st.set_page_config(page_title="3-2-1 投票アプリ", layout="centered")
 
@@ -63,7 +76,7 @@ ALIAS_MAP = {
 }
 
 def normalize_for_merge(name: str) -> str:
-    """同一視するための正規化キーを作る（NFKC、ひら→カナ、記号・空白除去、別名吸収）"""
+    """同一視するための正規化キー（NFKC、ひら→カナ、記号・空白除去、別名吸収）"""
     if not isinstance(name, str):
         return ""
     s = unicodedata.normalize("NFKC", name.strip())
@@ -120,12 +133,14 @@ def ensure_candidates_schema() -> pd.DataFrame:
 def ensure_votes_schema(cands: pd.DataFrame) -> pd.DataFrame:
     """votes.csv を voter_name, employee_id, *_id, time に正規化。旧 first/second/third（ラベル）にも対応。"""
     if os.path.exists(VOTES_FILE):
-        df = pd.read_csv(VOTES_FILE)
+        # 重要：すべて文字列として読み込み（社員番号の先頭0保持）、空白は空文字に
+        df = pd.read_csv(VOTES_FILE, dtype=str, keep_default_na=False)
+
         # 既に *_id であればそのまま（不足列は追加）
         if set(df.columns) >= {"first_id", "second_id", "third_id"}:
-            if "voter_name" not in df.columns: df["voter_name"] = ""
-            if "employee_id" not in df.columns: df["employee_id"] = ""
-            if "time" not in df.columns: df["time"] = ""
+            for col in ["voter_name", "employee_id", "first_id", "second_id", "third_id", "time"]:
+                if col not in df.columns:
+                    df[col] = ""
             df = df[["voter_name", "employee_id", "first_id", "second_id", "third_id", "time"]]
             df.to_csv(VOTES_FILE, index=False)
             return df
@@ -133,7 +148,7 @@ def ensure_votes_schema(cands: pd.DataFrame) -> pd.DataFrame:
         # 旧: first/second/third（ラベル名）→ *_id に変換
         if set(df.columns) >= {"first", "second", "third"}:
             label_to_id: Dict[str, str] = {r.label: r.id for r in cands.itertuples()}
-            def map_label(s): return label_to_id.get(s, None)
+            def map_label(s): return label_to_id.get(s, "")
             conv = pd.DataFrame({
                 "voter_name": df.get("voter_name", ""),
                 "employee_id": df.get("employee_id", ""),
@@ -164,12 +179,12 @@ def load_votes() -> pd.DataFrame:
 def append_vote(voter_name: str, employee_id: str, first_id: str, second_id: str, third_id: str):
     votes = load_votes()
     new_row = {
-        "voter_name": voter_name,
-        "employee_id": employee_id,
+        "voter_name": str(voter_name).strip(),
+        "employee_id": str(employee_id).strip(),  # 文字列として保持（先頭0を守る）
         "first_id": first_id,
         "second_id": second_id,
         "third_id": third_id,
-        "time": datetime.now().isoformat(),
+        "time": datetime.now().isoformat(timespec="seconds"),
     }
     votes = pd.concat([votes, pd.DataFrame([new_row])], ignore_index=True)
     votes.to_csv(VOTES_FILE, index=False)
@@ -192,8 +207,24 @@ def aggregate(cands: pd.DataFrame, votes: pd.DataFrame, include_inactive: bool =
         return pd.DataFrame(columns=["候補", "points", "first", "second", "third"])
     df = df.sort_values(["points", "first", "second", "third", "候補"],
                         ascending=[False, False, False, False, True]).reset_index(drop=True)
-    df.index = range(1, len(df) + 1)
+    df.index = range(1, len(df) + 1)  # 1始まり → これを順位として使う
     return df
+
+# ============================
+# 出力: Excel（特定列を文字列書式に）
+# ============================
+def to_xlsx_text(df: pd.DataFrame, text_cols=None, sheet_name="Sheet1") -> bytes:
+    text_cols = text_cols or []
+    buf = BytesIO()
+    with pd.ExcelWriter(buf, engine="xlsxwriter") as w:
+        df.to_excel(w, index=False, sheet_name=sheet_name)
+        ws = w.sheets[sheet_name]
+        fmt = w.book.add_format({"num_format": "@"})  # 文字列
+        for col in text_cols:
+            if col in df.columns:
+                i = df.columns.get_loc(col)
+                ws.set_column(i, i, None, fmt)  # 列を文字列書式に
+    return buf.getvalue()
 
 # ============================
 # ページ切替
@@ -207,9 +238,9 @@ if page == "vote":
     cands = load_candidates()
     votes = load_votes()  # 読むだけ
 
-    # 氏名・社員番号
+    # 氏名・社員番号（どちらも文字列で保持）
     voter_name = st.text_input("お名前（氏名）", placeholder="例：山田 太郎")
-    employee_id = st.text_input("社員番号", placeholder="例：A12345")
+    employee_id = st.text_input("社員番号（先頭0も可）", placeholder="例：001234")
 
     # アクティブ候補
     active = cands[cands["active"]].reset_index(drop=True)
@@ -247,40 +278,175 @@ if page == "vote":
 elif page == "admin":
     st.header("集計結果 & 候補管理（ID方式）")
 
+    # --- 自動更新設定（adminページのみ） ---
+    col1, col2 = st.columns([1, 2])
+    with col1:
+        try:
+            auto_refresh = st.toggle("自動更新", value=True, help="集計画面を一定間隔で再読み込み")
+        except Exception:
+            auto_refresh = st.checkbox("自動更新", value=True)
+    with col2:
+        interval_sec = st.number_input("間隔(秒)", min_value=2, max_value=60, value=5, step=1)
+
+    # votes.csv の最終更新（検知 & 表示）
+    def _votes_mtime():
+        try:
+            return os.path.getmtime(VOTES_FILE)
+        except Exception:
+            return 0.0
+    mtime = _votes_mtime()
+    last_mtime = st.session_state.get("_votes_mtime", 0.0)
+    if mtime != last_mtime and last_mtime != 0.0:
+        try:
+            st.toast("新しい票を検知しました（集計を更新）", icon="✅")
+        except Exception:
+            st.info("新しい票を検知しました（集計を更新）")
+    st.session_state["_votes_mtime"] = mtime
+    st.caption(f"votes.csv 最終更新: {datetime.fromtimestamp(mtime).strftime('%Y-%m-%d %H:%M:%S') if mtime else '-'}")
+
+    # 実際のオートリフレッシュ発火
+    if auto_refresh:
+        if _HAS_AUTOREFRESH:
+            st_autorefresh(interval=int(interval_sec * 1000), key="admin_autorefresh")
+        else:
+            # 依存なしの簡易フォールバック（環境によっては効かない場合あり）
+            st.markdown(f"<meta http-equiv='refresh' content='{int(interval_sec)}'>", unsafe_allow_html=True)
+
+    # ---- 以降は従来どおりの集計処理 ----
     cands = load_candidates()
     votes = load_votes()
 
     include_inactive = st.checkbox("非表示候補も集計表に含める", value=True)
     res_df = aggregate(cands, votes, include_inactive=include_inactive)
 
-    # 順位表
+    # ── 順位表（順位=1始まりのindexを列に）+ CSV
     st.subheader("順位表")
-    if votes.empty:
+    if votes.empty or res_df.empty:
         st.info("まだ投票はありません")
-    st.dataframe(res_df, use_container_width=True)
-    csv = res_df.to_csv(index=True)
-    st.download_button("CSVダウンロード", data=csv, file_name="result.csv", mime="text/csv")
+        res_df_disp = pd.DataFrame(columns=["順位","候補","合計ポイント","1位回数","2位回数","3位回数"])
+    else:
+        res_df_disp = (
+            res_df.reset_index()
+                  .rename(columns={
+                      "index": "順位",
+                      "points": "合計ポイント",
+                      "first": "1位回数",
+                      "second": "2位回数",
+                      "third": "3位回数",
+                  })
+        )
+        st.dataframe(res_df_disp, use_container_width=True)
+    csv = res_df_disp.to_csv(index=False)
+    st.download_button("順位表CSVダウンロード", data=csv, file_name="result.csv", mime="text/csv")
 
-    # 投票一覧（氏名・社員番号つき）
+    # ── グラフ：合計ポイント（棒）
+    st.subheader("合計ポイント（棒グラフ）")
+    if not res_df.empty:
+        chart_df = (
+            res_df.reset_index()
+                  .rename(columns={"index": "順位", "points": "合計ポイント"})
+        )
+        chart = (
+            alt.Chart(chart_df)
+               .mark_bar()
+               .encode(
+                   x=alt.X("候補:N", sort='-y', title="候補"),
+                   y=alt.Y("合計ポイント:Q", title="合計ポイント"),
+                   tooltip=["順位","候補","合計ポイント","first","second","third"]
+               )
+               .properties(height=320)
+        )
+        st.altair_chart(chart, use_container_width=True)
+    else:
+        st.caption("投票が入るとここに合計ポイントのグラフが表示されます。")
+
+    # ── グラフ：1/2/3位回数（積み上げ棒）
+    st.subheader("1位・2位・3位 回数（積み上げ棒グラフ）")
+    if not res_df.empty:
+        counts_df = (
+            res_df.reset_index()
+                  .rename(columns={
+                      "index": "順位",
+                      "first": "1位回数",
+                      "second": "2位回数",
+                      "third": "3位回数",
+                  })
+        )
+        counts_melt = counts_df.melt(
+            id_vars=["順位","候補"],
+            value_vars=["1位回数","2位回数","3位回数"],
+            var_name="区分", value_name="回数"
+        )
+        chart2 = (
+            alt.Chart(counts_melt)
+               .mark_bar()
+               .encode(
+                   x=alt.X("候補:N", sort='-y', title="候補"),
+                   y=alt.Y("回数:Q", title="回数"),
+                   color=alt.Color("区分:N", title="順位区分"),
+                   tooltip=["順位","候補","区分","回数"]
+               )
+               .properties(height=320)
+        )
+        st.altair_chart(chart2, use_container_width=True)
+
+    st.divider()
+
+    # ── 投票一覧（氏名・社員番号つき：ラベル表示）
     st.subheader("投票一覧（氏名・社員番号つき）")
     if votes.empty:
         st.info("まだ投票はありません")
     else:
-        id_to_label = {r.id: r.label for r in cands.itertuples()}
+        id_to_label = dict(zip(cands["id"], cands["label"]))
         detail_df = votes.copy()
-        detail_df["1位"] = detail_df["first_id"].map(id_to_label)
-        detail_df["2位"] = detail_df["second_id"].map(id_to_label)
-        detail_df["3位"] = detail_df["third_id"].map(id_to_label)
+
+        # ID → ラベル変換（存在しないIDはそのまま表示）
+        for col in ["first_id", "second_id", "third_id"]:
+            detail_df[col] = detail_df[col].astype(str)
+        detail_df["1位"] = detail_df["first_id"].map(id_to_label).fillna(detail_df["first_id"])
+        detail_df["2位"] = detail_df["second_id"].map(id_to_label).fillna(detail_df["second_id"])
+        detail_df["3位"] = detail_df["third_id"].map(id_to_label).fillna(detail_df["third_id"])
+
+        # 社員番号は常に文字列として表示＋任意ゼロ埋め
+        detail_df["employee_id"] = detail_df["employee_id"].astype(str)
+        pad = st.number_input("社員番号の表示桁数（ゼロ埋め・0=変換しない）", min_value=0, max_value=20, value=0, step=1)
+        if pad > 0:
+            detail_df["employee_id"] = detail_df["employee_id"].str.zfill(int(pad))
+
         show_cols = ["voter_name", "employee_id", "1位", "2位", "3位", "time"]
         show_cols = [c for c in show_cols if c in detail_df.columns]
-        st.dataframe(detail_df[show_cols], use_container_width=True)
-        csv_detail = detail_df[show_cols].to_csv(index=False)
-        st.download_button("投票一覧CSVをダウンロード（氏名・社員番号付き）",
-                           data=csv_detail, file_name="votes_detail.csv", mime="text/csv")
+
+        # 画面表示（TextColumnで数値解釈を防止、古い版はfallback）
+        try:
+            st.dataframe(
+                detail_df[show_cols],
+                use_container_width=True,
+                column_config={"employee_id": st.column_config.TextColumn("社員番号")}
+            )
+        except Exception:
+            st.dataframe(detail_df[show_cols], use_container_width=True)
+
+        # ラベル版CSV（クォート強化）
+        csv_detail = detail_df[show_cols].to_csv(index=False, quoting=csv.QUOTE_ALL)
+        st.download_button(
+            "投票一覧CSVをダウンロード（ラベル版・氏名/社員番号付き）",
+            data=csv_detail,
+            file_name="votes_labeled.csv",
+            mime="text/csv"
+        )
+
+        # ラベル版Excel（社員番号を文字列書式で、先頭0完全保持）
+        xlsx_bytes = to_xlsx_text(detail_df[show_cols], text_cols=["employee_id"], sheet_name="votes")
+        st.download_button(
+            "投票一覧Excelをダウンロード（ラベル版・先頭0保持）",
+            data=xlsx_bytes,
+            file_name="votes_labeled.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        )
 
     st.divider()
 
-    # 候補の編集（追加 / 名称変更 / 有効・無効切替 / 同義統合）
+    # ── 候補の編集（追加 / 名称変更 / 有効・無効切替 / 同義統合）
     st.subheader("候補の編集")
 
     col_add1, col_add2 = st.columns([3, 1])
@@ -309,12 +475,12 @@ elif page == "admin":
                     base_id = base["id"]
                     cands.loc[cands["id"] == base_id, ["label", "active"]] = [label_s, True]
                     # 余剰候補の票を基準IDへ付替え、候補を削除
-                    for _, r in conflict.iloc[1:].iterrows():
-                        dup_id = r["id"]
-                        if not votes.empty:
+                    if not votes.empty:
+                        for _, r in conflict.iloc[1:].iterrows():
+                            dup_id = r["id"]
                             for col in ["first_id", "second_id", "third_id"]:
                                 votes[col] = votes[col].replace(dup_id, base_id)
-                        cands = cands[cands["id"] != dup_id]
+                    cands = cands[~cands["id"].isin(conflict.iloc[1:]["id"].tolist())]
                     save_candidates(cands)
                     if not votes.empty:
                         votes.to_csv(VOTES_FILE, index=False)
@@ -345,12 +511,12 @@ elif page == "admin":
                     cands.loc[cands["id"] == cid, ["label", "active"]] = [label_s, active]
 
                     # 競合の統合（票の付替え＋候補削除）
-                    for _, r in conflict.iterrows():
-                        dup_id = r["id"]
-                        if not votes.empty:
+                    if not votes.empty and not conflict.empty:
+                        for _, r in conflict.iterrows():
+                            dup_id = r["id"]
                             for col in ["first_id", "second_id", "third_id"]:
                                 votes[col] = votes[col].replace(dup_id, cid)
-                        cands = cands[cands["id"] != dup_id]
+                    cands = cands[~cands["id"].isin(conflict["id"].tolist())] if not conflict.empty else cands
 
                     if "_key" in cands.columns:
                         cands = cands.drop(columns=["_key"])
@@ -377,12 +543,14 @@ elif page == "admin":
 elif page == "thanks":
     st.header("送信しました")
     st.success("ご投票ありがとうございました！")
-    st.markdown("[🗳️ もう一度投票する](?page=vote) | [📊 集計を見る](?page=admin)")
+    st.markdown("[🗳️ もう一度投票する](?page=vote)")
 
 # ---------------- フォールバック ----------------
 else:
     st.info("""以下のURLを利用してください:
 - 投票: ?page=vote
 - 集計: ?page=admin""")
+
+
 
 

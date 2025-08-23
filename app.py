@@ -123,7 +123,7 @@ def ensure_candidates_schema() -> pd.DataFrame:
 def ensure_votes_schema(cands: pd.DataFrame) -> pd.DataFrame:
     """votes.csv を voter_name, employee_id, *_id, time に正規化。旧 first/second/third（ラベル）にも対応。"""
     if os.path.exists(VOTES_FILE):
-        df = pd.read_csv(VOTES_FILE)
+        df = pd.read_csv(VOTES_FILE, dtype=str, keep_default_na=False)
         # 既に *_id であればそのまま（不足列は追加）
         if set(df.columns) >= {"first_id", "second_id", "third_id"}:
             if "voter_name" not in df.columns: df["voter_name"] = ""
@@ -168,7 +168,7 @@ def append_vote(voter_name: str, employee_id: str, first_id: str, second_id: str
     votes = load_votes()
     new_row = {
         "voter_name": voter_name,
-        "employee_id": employee_id,
+        "employee_id": str(employee_id).strip(),
         "first_id": first_id,
         "second_id": second_id,
         "third_id": third_id,
@@ -341,6 +341,7 @@ elif page == "admin":
         detail_df["3位"] = detail_df["third_id"].map(id_to_label)
         show_cols = ["voter_name", "employee_id", "1位", "2位", "3位", "time"]
         show_cols = [c for c in show_cols if c in detail_df.columns]
+        detail_df["employee_id"] = detail_df["employee_id"].astype(str)
         st.dataframe(detail_df[show_cols], use_container_width=True)
         csv_detail = detail_df[show_cols].to_csv(index=False)
         st.download_button("投票一覧CSVをダウンロード（氏名・社員番号付き）",
