@@ -8,14 +8,16 @@ Streamlit版 3-2-1投票アプリ（ID方式・翻訳抑止・候補編集/同�
 - 集計：総得点・1/2/3位回数・順位（1始まり）を表示、CSVダウンロード
 - グラフ：合計ポイントの棒グラフ、1/2/3位回数の積み上げ棒グラフ
 - 投票一覧：氏名・社員番号つきの生票一覧表示とCSVダウンロード
-- 管理：候補の追加／名称変更／有効/無効切替、同義統合（重複候補の票も安全に付替え）
-- 翻訳抑止：Google翻訳の自動提案を抑止（完全ではないが軽減）
+- 管理：候補の追加／名称変更／有効/無効切替、同義統合、候補の完全削除
+- 翻訳抑止：Google翻訳の自動提案を軽減
+- 時刻：JST（pytz使用、既定 Asia/Tokyo）
+- 重複投票防止：社員番号で1人1回（完全禁止）
 
 ■ 起動
-  pip install streamlit pandas altair
+  pip install streamlit pandas altair pytz
   streamlit run app.py
-  → 投票:  http://localhost:8501/?page=vote
-  → 集計:  http://localhost:8501/?page=admin
+  → 投票:   http://localhost:8501/?page=vote
+  → 集計:   http://localhost:8501/?page=admin
   → サンクス: http://localhost:8501/?page=thanks
 """
 
@@ -23,9 +25,14 @@ from __future__ import annotations
 import os, re, unicodedata, uuid
 from datetime import datetime
 from typing import Dict
+
 import pandas as pd
 import streamlit as st
 import altair as alt
+import pytz
+
+# ===== タイムゾーン（既定: Asia/Tokyo） =====
+TZ = pytz.timezone(os.getenv("APP_TIMEZONE", "Asia/Tokyo"))
 
 st.set_page_config(page_title="3-2-1 投票アプリ", layout="centered")
 
@@ -56,6 +63,16 @@ def disable_auto_translate():
 disable_auto_translate()
 
 # -----------------------------
+# 正規化ヘルパ
+# -----------------------------
+def norm_emp_id(s: str) -> str:
+    """社員番号の正規化：全角→半角、前後空白除去、英字は大文字へ"""
+    if not isinstance(s, str):
+        s = "" if s is None else str(s)
+    s = unicodedata.normalize("NFKC", s).strip()
+    return s.upper()
+
+# -----------------------------
 # 同義語/同音語マップ（必要に応じて拡張）
 # -----------------------------
 ALIAS_MAP = {
@@ -66,7 +83,7 @@ ALIAS_MAP = {
 }
 
 def normalize_for_merge(name: str) -> str:
-    """同一視するための正規化キーを作る（NFKC、ひら→カナ、記号・空白除去、別名吸収）"""
+    """同一視キー（NFKC、ひら→カナ、記号・空白除去、別名吸収）"""
     if not isinstance(name, str):
         return ""
     s = unicodedata.normalize("NFKC", name.strip())
@@ -121,9 +138,12 @@ def ensure_candidates_schema() -> pd.DataFrame:
     return df
 
 def ensure_votes_schema(cands: pd.DataFrame) -> pd.DataFrame:
-    """votes.csv を voter_name, employee_id, *_id, time に正規化。旧 first/second/third（ラベル）にも対応。"""
+    """
+    votes.csv を voter_name, employee_id, *_id, time に正規化。
+    旧 first/second/third（ラベル）にも対応。読み込みは dtype=str で先頭ゼロを保持。
+    """
     if os.path.exists(VOTES_FILE):
-        df = pd.read_csv(VOTES_FILE)
+        df = pd.read_csv(VOTES_FILE, dtype=str)  # ★ 重要：全列を文字列で読む
         # 既に *_id であればそのまま（不足列は追加）
         if set(df.columns) >= {"first_id", "second_id", "third_id"}:
             if "voter_name" not in df.columns: df["voter_name"] = ""
@@ -172,7 +192,8 @@ def append_vote(voter_name: str, employee_id: str, first_id: str, second_id: str
         "first_id": first_id,
         "second_id": second_id,
         "third_id": third_id,
-        "time": datetime.now().isoformat(timespec="seconds"),
+        # JSTで保存
+        "time": datetime.now(TZ).isoformat(timespec="seconds"),
     }
     votes = pd.concat([votes, pd.DataFrame([new_row])], ignore_index=True)
     votes.to_csv(VOTES_FILE, index=False)
@@ -197,6 +218,27 @@ def aggregate(cands: pd.DataFrame, votes: pd.DataFrame, include_inactive: bool =
                         ascending=[False, False, False, False, True]).reset_index(drop=True)
     df.index = range(1, len(df) + 1)  # 1始まり → これを順位として使う
     return df
+
+# ============================
+# JST表示ヘルパ
+# ============================
+def to_jst_str(s: str) -> str:
+    """votes.csv の time（ISO/文字列/UTC/naive混在想定）を JST の YYYY-MM-DD HH:MM:SS に"""
+    try:
+        if not isinstance(s, str):
+            s = str(s)
+        if not s:
+            return s
+        dt_utc = pd.to_datetime(s, utc=True, errors="coerce")
+        if pd.isna(dt_utc):
+            # すでにローカルっぽい文字列 → naive とみなして JST を付与
+            dt_naive = pd.to_datetime(s, errors="coerce")
+            if pd.isna(dt_naive):
+                return s
+            return dt_naive.tz_localize(TZ).strftime("%Y-%m-%d %H:%M:%S")
+        return dt_utc.tz_convert("Asia/Tokyo").strftime("%Y-%m-%d %H:%M:%S")
+    except Exception:
+        return s
 
 # ============================
 # ページ切替
@@ -242,6 +284,16 @@ if page == "vote":
         elif len({first_id, second_id, third_id}) < 3:
             st.error("同じ候補は重複して選べません")
         else:
+            # ★ 重複投票チェック（社員番号で1人1回）
+            emp_norm = norm_emp_id(employee_id)
+            v = load_votes()
+            if not v.empty:
+                v = v.copy()
+                v["employee_id_norm"] = v["employee_id"].astype(str).map(norm_emp_id)
+                if emp_norm in set(v["employee_id_norm"]):
+                    st.error("この社員番号では既に投票済みです（1人1回まで）。")
+                    st.stop()
+
             append_vote(voter_name, employee_id, first_id, second_id, third_id)
             st.query_params.update(page="thanks")
             st.rerun()
@@ -249,6 +301,10 @@ if page == "vote":
 # ---------------- 集計/管理ページ ----------------
 elif page == "admin":
     st.header("集計結果 & 候補管理（ID方式）")
+
+    # 手動リロードボタン
+    if st.button("データ更新（リロード）", type="primary"):
+        st.rerun()
 
     cands = load_candidates()
     votes = load_votes()
@@ -339,6 +395,9 @@ elif page == "admin":
         detail_df["1位"] = detail_df["first_id"].map(id_to_label)
         detail_df["2位"] = detail_df["second_id"].map(id_to_label)
         detail_df["3位"] = detail_df["third_id"].map(id_to_label)
+        # 時刻をJST表示へ
+        if "time" in detail_df.columns:
+            detail_df["time"] = detail_df["time"].astype(str).map(to_jst_str)
         show_cols = ["voter_name", "employee_id", "1位", "2位", "3位", "time"]
         show_cols = [c for c in show_cols if c in detail_df.columns]
         st.dataframe(detail_df[show_cols], use_container_width=True)
@@ -348,7 +407,7 @@ elif page == "admin":
 
     st.divider()
 
-    # ── 候補の編集（追加 / 名称変更 / 有効・無効切替 / 同義統合）
+    # ── 候補の編集（追加 / 名称変更 / 有効・無効切替 / 同義統合 / 完全削除）
     st.subheader("候補の編集")
 
     col_add1, col_add2 = st.columns([3, 1])
@@ -393,7 +452,7 @@ elif page == "admin":
 
     # 既存候補の編集
     for idx, row in cands.reset_index(drop=True).iterrows():
-        col1, col2, col3, col4 = st.columns([4, 2, 2, 2])
+        col1, col2, col3, col4 = st.columns([4, 2, 2, 3])
         with col1:
             new_label = st.text_input("名称", value=row["label"], key=f"label_{idx}")
         with col2:
@@ -428,9 +487,22 @@ elif page == "admin":
                     st.success("保存しました（同義統合を適用）")
                     st.rerun()
         with col4:
+            # 有効/無効切替
             if st.button("有効/無効切替", key=f"toggle_{idx}"):
                 cands.loc[cands["id"] == row["id"], "active"] = not bool(row["active"])
                 save_candidates(cands)
+                st.rerun()
+
+            # 完全削除（当該候補が入った票のその順位は空欄にする）
+            if st.button("削除", key=f"delete_{idx}"):
+                cid = row["id"]
+                if not votes.empty:
+                    for col in ["first_id", "second_id", "third_id"]:
+                        votes[col] = votes[col].where(votes[col] != cid, None)
+                    votes.to_csv(VOTES_FILE, index=False)
+                cands = cands[cands["id"] != cid]
+                save_candidates(cands)
+                st.success(f"候補『{row['label']}』を削除しました（既存票は空欄に置換）")
                 st.rerun()
 
     st.divider()
@@ -445,7 +517,7 @@ elif page == "admin":
 elif page == "thanks":
     st.header("送信しました")
     st.success("ご投票ありがとうございました！")
-    st.markdown("[🗳️ もう一度投票する](?page=vote)")
+
 
 # ---------------- フォールバック ----------------
 else:
